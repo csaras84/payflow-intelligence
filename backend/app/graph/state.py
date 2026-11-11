@@ -47,14 +47,10 @@ class LiquidityLever(BaseModel):
     source_type: Literal["PAYPAL_DISPUTE_HOLD", "OVERDUE_PAYPAL_INVOICE"]
     counterparty: str
     gross_amount_usd: float
-    gross_amount_inr: float
     net_unlockable_usd: float
-    net_unlockable_inr: float
     recovery_probability: float
     expected_recovery_usd: float
-    expected_recovery_inr: float
     available_by_friday_usd: float
-    available_by_friday_inr: float
     est_settlement_hours: int
     priority_score: float
     paypal_action: str
@@ -68,7 +64,6 @@ class SupplierObligation(BaseModel):
     supplier_paypal_email: str
     purchase_order_id: str
     amount_required_usd: float
-    amount_required_inr: float
     due_description: str
 
 
@@ -79,19 +74,15 @@ class AuditLogEntry(BaseModel):
     reference_id: str
     verified_status: str
     cash_impact_usd: float
-    cash_impact_inr: float
     details: str
 
 
 class TreasuryState(TypedDict):
     # 1. Diagnose cash gap
     merchant_query: str
-    usd_to_inr_rate: float
     available_balance_usd: float
-    available_balance_inr: float
     target_obligation: SupplierObligation
     initial_gap_usd: float
-    initial_gap_inr: float
 
     # 2. Parallel analysis outputs
     open_disputes: List[DisputeEvidence]
@@ -100,11 +91,8 @@ class TreasuryState(TypedDict):
     # 3. Synthesize plan outputs (feeds AG Grid)
     ranked_options: List[LiquidityLever]
     immediate_friday_cash_usd: float
-    immediate_friday_cash_inr: float
     expected_total_recovery_usd: float
-    expected_total_recovery_inr: float
     projected_friday_balance_usd: float
-    projected_friday_balance_inr: float
 
     # 4. Merchant approval gate
     approval_status: Literal["PENDING_APPROVAL", "APPROVED", "REJECTED"]

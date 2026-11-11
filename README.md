@@ -9,7 +9,7 @@ PayFlow Intelligence helps small and medium merchants solve acute cash-flow shor
 1. **Working-Capital Gap Diagnosis:** Queries merchant balance, transaction history, and pending obligations to compute the exact liquidity shortfall required to fund an upcoming supplier payout.
 2. **Autonomous Dispute Unfreezing:** Inspects open PayPal buyer disputes, extracts delivery proof from merchant courier PDFs, and submits tracking evidence (`create_shipment_tracking`) or evaluates partial claim acceptance (`accept_dispute_claim`) based on expected cash recovery speed.
 3. **Receivables Acceleration:** Ranks unpaid PayPal invoices by expected yield and dispatches targeted reminders (`send_invoice_reminder`) with instant-settlement QR codes (`generate_invoice_qr_code`).
-4. **Human-in-the-Loop Treasury Execution:** Uses LangGraph `interrupt()` checkpoints to present a single approval card showing net rupee impact before executing supplier orders (`create_order`, `pay_order`) in PayPal Sandbox.
+4. **Human-in-the-Loop Treasury Execution:** Uses LangGraph `interrupt()` checkpoints to present a single approval card showing the net USD cash impact before paying the supplier via PayPal Payouts in the Sandbox.
 
 ## System Architecture
 

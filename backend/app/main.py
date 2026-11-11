@@ -18,8 +18,7 @@ app.add_middleware(
 
 
 class PlanRequest(BaseModel):
-    merchant_query: str = "I need ₹1,50,000 by Friday to pay our wholesale coffee supplier, Apex Roasters."
-    usd_to_inr_rate: float = 84.0
+    merchant_query: str = "I need $1,800 by Friday to pay our wholesale coffee supplier, Apex Roasters."
 
 
 class ExecuteRequest(BaseModel):
@@ -34,7 +33,6 @@ def create_treasury_plan(req: PlanRequest):
 
     initial_state = {
         "merchant_query": req.merchant_query,
-        "usd_to_inr_rate": req.usd_to_inr_rate,
         "audit_log": [],
     }
 

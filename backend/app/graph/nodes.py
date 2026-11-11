@@ -61,33 +61,25 @@ def _get_claude() -> ChatAnthropic:
 # --- STEP 1: Diagnose Cash Gap (Read-Only) ---
 
 def diagnose_cash_gap(state: TreasuryState) -> Dict[str, Any]:
-    rate = state.get("usd_to_inr_rate") or 84.0
     balance_usd = paypal_client.get_available_balance_usd()
-    balance_inr = round(balance_usd * rate, 2)
 
-    # Default target: ₹1,50,000 (~$1,785.71 USD at 1 USD = ₹84)
-    required_inr = 150000.0
-    required_usd = round(required_inr / rate, 2)
+    # Default target: $1,800 supplier payment due Friday
+    required_usd = 1800.0
 
     obligation = SupplierObligation(
         supplier_name="Apex Roasters Wholesale",
         supplier_paypal_email="settlements-facilitator@apexroasters.example.com",
         purchase_order_id="PO-2026-884",
         amount_required_usd=required_usd,
-        amount_required_inr=required_inr,
         due_description="Friday Wholesale Inventory Cutoff",
     )
 
     gap_usd = round(max(0.0, required_usd - balance_usd), 2)
-    gap_inr = round(gap_usd * rate, 2)
 
     return {
-        "usd_to_inr_rate": rate,
         "available_balance_usd": balance_usd,
-        "available_balance_inr": balance_inr,
         "target_obligation": obligation,
         "initial_gap_usd": gap_usd,
-        "initial_gap_inr": gap_inr,
     }
 
 
@@ -259,7 +251,6 @@ def analyze_invoices(state: TreasuryState) -> Dict[str, Any]:
 # --- STEP 3: Synthesize Plan (Deterministic Python Scoring & Ranking) ---
 
 def synthesize_plan(state: TreasuryState) -> Dict[str, Any]:
-    rate = state["usd_to_inr_rate"]
     levers: List[LiquidityLever] = []
 
     for d in state.get("open_disputes", []):
@@ -284,14 +275,10 @@ def synthesize_plan(state: TreasuryState) -> Dict[str, Any]:
                 source_type="PAYPAL_DISPUTE_HOLD",
                 counterparty=f"Dispute {d.dispute_id} ({d.reason.split('_')[-1]})",
                 gross_amount_usd=d.disputed_amount_usd,
-                gross_amount_inr=round(d.disputed_amount_usd * rate, 2),
                 net_unlockable_usd=d.net_cash_unlocked_usd,
-                net_unlockable_inr=round(d.net_cash_unlocked_usd * rate, 2),
                 recovery_probability=d.recovery_probability,
                 expected_recovery_usd=expected_usd,
-                expected_recovery_inr=round(expected_usd * rate, 2),
                 available_by_friday_usd=friday_usd,
-                available_by_friday_inr=round(friday_usd * rate, 2),
                 est_settlement_hours=hours,
                 priority_score=priority,
                 paypal_action=action_label,
@@ -313,14 +300,10 @@ def synthesize_plan(state: TreasuryState) -> Dict[str, Any]:
                 source_type="OVERDUE_PAYPAL_INVOICE",
                 counterparty=f"{inv.customer_name} ({inv.invoice_number})",
                 gross_amount_usd=inv.amount_due_usd,
-                gross_amount_inr=round(inv.amount_due_usd * rate, 2),
                 net_unlockable_usd=inv.amount_due_usd,
-                net_unlockable_inr=round(inv.amount_due_usd * rate, 2),
                 recovery_probability=inv.historical_reliability,
                 expected_recovery_usd=expected_usd,
-                expected_recovery_inr=round(expected_usd * rate, 2),
                 available_by_friday_usd=friday_usd,
-                available_by_friday_inr=round(friday_usd * rate, 2),
                 est_settlement_hours=hours,
                 priority_score=priority,
                 paypal_action="send_invoice_reminder",
@@ -340,11 +323,8 @@ def synthesize_plan(state: TreasuryState) -> Dict[str, Any]:
     return {
         "ranked_options": levers,
         "immediate_friday_cash_usd": friday_cash_usd,
-        "immediate_friday_cash_inr": round(friday_cash_usd * rate, 2),
         "expected_total_recovery_usd": total_expected_usd,
-        "expected_total_recovery_inr": round(total_expected_usd * rate, 2),
         "projected_friday_balance_usd": proj_balance_usd,
-        "projected_friday_balance_inr": round(proj_balance_usd * rate, 2),
         "approval_status": "PENDING_APPROVAL",
     }
 
@@ -352,7 +332,6 @@ def synthesize_plan(state: TreasuryState) -> Dict[str, Any]:
 # --- STEP 4: Execute Plan (Approved Writes Only) ---
 
 def execute_plan(state: TreasuryState) -> Dict[str, Any]:
-    rate = state["usd_to_inr_rate"]
     approved_ids = set(state.get("approved_lever_ids", []))
     disputes_by_id = {d.dispute_id: d for d in state.get("open_disputes", [])}
     invoices_by_id = {i.invoice_id: i for i in state.get("overdue_invoices", [])}
@@ -399,7 +378,6 @@ def execute_plan(state: TreasuryState) -> Dict[str, Any]:
                     reference_id=d.dispute_id,
                     verified_status=res["status"],
                     cash_impact_usd=lever.available_by_friday_usd,
-                    cash_impact_inr=lever.available_by_friday_inr,
                     details=lever.drafted_message,
                 )
             )
@@ -421,7 +399,6 @@ def execute_plan(state: TreasuryState) -> Dict[str, Any]:
                     reference_id=inv.invoice_id,
                     verified_status=res["status"],
                     cash_impact_usd=lever.available_by_friday_usd,
-                    cash_impact_inr=lever.available_by_friday_inr,
                     details=lever.drafted_message,
                 )
             )
@@ -451,7 +428,6 @@ def execute_plan(state: TreasuryState) -> Dict[str, Any]:
                 reference_id=payout_id,
                 verified_status=payout_res["status"],
                 cash_impact_usd=-obligation.amount_required_usd,
-                cash_impact_inr=-obligation.amount_required_inr,
                 details=f"Supplier payout to {obligation.supplier_name} ({obligation.purchase_order_id})",
             )
         )
@@ -459,7 +435,6 @@ def execute_plan(state: TreasuryState) -> Dict[str, Any]:
     return {
         "ranked_options": updated_levers,
         "projected_friday_balance_usd": new_friday_balance_usd,
-        "projected_friday_balance_inr": round(new_friday_balance_usd * rate, 2),
         "payout_batch_id": payout_id,
         "payout_status": payout_status,
         "audit_log": logs,
@@ -469,7 +444,6 @@ def execute_plan(state: TreasuryState) -> Dict[str, Any]:
 # --- STEP 5: Verify and Audit (Read-Only Confirmation) ---
 
 def verify_and_audit(state: TreasuryState) -> Dict[str, Any]:
-    rate = state["usd_to_inr_rate"]
     verification_logs: List[AuditLogEntry] = []
 
     for lever in state.get("ranked_options", []):
@@ -483,7 +457,6 @@ def verify_and_audit(state: TreasuryState) -> Dict[str, Any]:
                     reference_id=lever.lever_id,
                     verified_status=live_status,
                     cash_impact_usd=0.0,
-                    cash_impact_inr=0.0,
                     details=f"Confirmed dispute {lever.lever_id} transitioned to {live_status}.",
                 )
             )
@@ -501,7 +474,6 @@ def verify_and_audit(state: TreasuryState) -> Dict[str, Any]:
                 reference_id=payout_id,
                 verified_status=verified_batch_status,
                 cash_impact_usd=0.0,
-                cash_impact_inr=0.0,
                 details=f"Verified Payout Batch {payout_id} status: {verified_batch_status}.",
             )
         )
@@ -513,10 +485,10 @@ def verify_and_audit(state: TreasuryState) -> Dict[str, Any]:
     )
 
     summary = (
-        f"Unlocked ${state['immediate_friday_cash_usd']:.2f} (₹{state['immediate_friday_cash_inr']:,.0f}) "
+        f"Unlocked ${state['immediate_friday_cash_usd']:,.2f} "
         f"in Friday working capital across approved disputes and invoices. "
         f"Supplier payout {payout_id or 'N/A'} status: {final_payout_status}. "
-        f"Projected post-payout balance: ${ending_after_payout_usd:.2f} (₹{ending_after_payout_usd * rate:,.0f})."
+        f"Projected post-payout balance: ${ending_after_payout_usd:,.2f}."
     )
 
     return {

@@ -18,8 +18,8 @@ a supplier — all against the live PayPal Sandbox.
 3. **Real sandbox data only.** Disputes, invoices and the supplier payout are real
    Sandbox objects. Demo data is created ahead of time by a seed script plus a few
    manual buyer actions (see §9).
-4. **One currency in PayPal, rupees on screen.** PayPal runs in USD. The UI shows
-   INR using a fixed rate stored in config and displayed next to every total.
+4. **One currency: USD.** PayPal and the UI both use USD, so every number on
+   screen is the same number PayPal holds; no conversion step.
 5. **Every PayPal change is logged and safe to retry.** Each write sends a
    `PayPal-Request-Id` header and is written to an audit log with the PayPal ID
    it returned.
@@ -69,7 +69,7 @@ a supplier — all against the live PayPal Sandbox.
 
 | # | Step | Reads / calls | AI's job | Python's job | Output added to state |
 |---|------|---------------|----------|--------------|-----------------------|
-| 1 | `diagnose_liquidity` | `GET /v1/reporting/balances` | Parse request → `{amount, currency, deadline, supplier_name, supplier_email}` | Convert INR→USD, compute `gap = target − available` | `goal`, `available_cash`, `gap` |
+| 1 | `diagnose_liquidity` | `GET /v1/reporting/balances` | Parse request → `{amount, currency, deadline, supplier_name, supplier_email}` | Compute `gap = target − available` | `goal`, `available_cash`, `gap` |
 | 2A | `analyze_disputes` | `list_disputes`, `get_dispute`; courier PDFs from `backend/demo_assets/` | Extract tracking no./carrier/delivery date from PDF; recommend **contest** or **accept partial** with a reason | Match PDF to dispute by transaction ID; score each option (§5) | `dispute_options[]` |
 | 2B | `analyze_receivables` | `list_invoices` (status `SENT`, `UNPAID`, `PARTIALLY_PAID`) | Write a short, personalised reminder per invoice | Days overdue, payment likelihood, expected value (§5) | `invoice_options[]` |
 | 3 | `synthesize_plan` | — | One-paragraph plain-English plan summary | Merge, rank by expected cash before deadline, pre-select the smallest set that covers the gap, compute projected balance | `levers[]`, `plan_summary`, `coverage` |
@@ -137,7 +137,7 @@ the selection in the grid.
 
 | Task | Step | Output schema (Pydantic) | Guardrail |
 |------|------|--------------------------|-----------|
-| Read merchant request | 1 | `Goal{amount, currency, deadline, supplier_name, supplier_email}` | Amount > 0; deadline in the future; currency in {INR, USD} |
+| Read merchant request | 1 | `Goal{amount, currency, deadline, supplier_name, supplier_email}` | Amount > 0; deadline in the future; currency is USD |
 | Read courier PDF | 2A | `Evidence{tracking_number, carrier, delivered_on, recipient_name}` | Tracking no. format check; `delivered_on` ≤ today |
 | Choose dispute strategy | 2A | `DisputeDecision{action: contest\|accept_partial, refund_amount?, reason}` | `refund_amount` ≤ disputed amount; reason required |
 | Write reminder text | 2B | `Reminder{subject, body}` | ≤ 600 chars; no amounts that differ from the invoice |
@@ -170,7 +170,6 @@ class TreasuryState(TypedDict):
     thread_id: str
     merchant_query: str
     goal: Goal
-    fx_inr_per_usd: float
     available_usd: float
     gap_usd: float
     dispute_options: list[Lever]
@@ -191,10 +190,10 @@ class TreasuryState(TypedDict):
 **`POST /api/treasury/plan`**
 ```json
 // request
-{ "merchant_query": "I need ₹1,50,000 by Friday to pay Apex Roasters (apex@example.com)." }
+{ "merchant_query": "I need $1,800 by Friday to pay Apex Roasters (apex@example.com)." }
 // response
 { "thread_id": "…", "status": "PENDING_REVIEW",
-  "goal": {…}, "available_usd": 412.50, "gap_usd": 1387.50, "fx_inr_per_usd": 84.0,
+  "goal": {…}, "available_usd": 412.50, "gap_usd": 1387.50,
   "levers": [ Lever, … ], "plan_summary": "…", "warnings": [] }
 ```
 
@@ -232,7 +231,7 @@ The app runs with zero setup on SQLite; Postgres is optional.
 
 | Area | Contents |
 |------|----------|
-| Cash-gap header | Target, available now, gap, expected recovery, projected balance — INR with USD underneath, FX rate shown |
+| Cash-gap header | Target, available now, gap, expected recovery, projected balance, all in USD |
 | Options grid (AG Grid) | One row per lever: type, counterparty, amount, p(success), p(before deadline), expected cash, AI reason; checkbox to select; running total vs gap |
 | Approval panel | Selected actions in plain language, editable reminder/evidence text, "Approve & execute" button |
 | Audit log | After execution: each PayPal call, its returned ID, status, time |

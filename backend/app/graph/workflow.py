@@ -20,9 +20,7 @@ def merchant_approval(state: TreasuryState) -> Dict[str, Any]:
         {
             "thread_status": "WAITING_FOR_MERCHANT_APPROVAL",
             "initial_gap_usd": state["initial_gap_usd"],
-            "initial_gap_inr": state["initial_gap_inr"],
             "immediate_friday_cash_usd": state["immediate_friday_cash_usd"],
-            "immediate_friday_cash_inr": state["immediate_friday_cash_inr"],
             "ranked_options_count": len(state.get("ranked_options", [])),
         }
     )
