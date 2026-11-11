@@ -3,7 +3,6 @@ import math
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 from pydantic import BaseModel, Field
-from langchain_anthropic import ChatAnthropic
 from app.graph.state import (
     AuditLogEntry,
     DisputeEvidence,
@@ -53,9 +52,27 @@ class InvoiceReminderSchema(BaseModel):
     )
 
 
-def _get_claude() -> ChatAnthropic:
-    model_name = os.getenv("LLM_MODEL", "claude-3-5-sonnet-latest")
-    return ChatAnthropic(model=model_name, temperature=0.1)
+def _get_llm():
+    """Return the configured chat model, or None to use the rule-based fallback.
+
+    Order: Azure OpenAI (if AZURE_OPENAI_* is set) -> Anthropic (if ANTHROPIC_API_KEY
+    is set) -> None. Imports are lazy so a provider's package is only needed if used.
+    """
+    if os.getenv("AZURE_OPENAI_API_KEY") and os.getenv("AZURE_OPENAI_ENDPOINT") and os.getenv("AZURE_OPENAI_DEPLOYMENT"):
+        from langchain_openai import AzureChatOpenAI
+
+        return AzureChatOpenAI(
+            azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21"),
+            temperature=0.1,
+        )
+    if os.getenv("ANTHROPIC_API_KEY"):
+        from langchain_anthropic import ChatAnthropic
+
+        return ChatAnthropic(model=os.getenv("LLM_MODEL", "claude-sonnet-5-5"), temperature=0.1)
+    return None
 
 
 # --- STEP 1: Diagnose Cash Gap (Read-Only) ---
@@ -83,13 +100,13 @@ def diagnose_cash_gap(state: TreasuryState) -> Dict[str, Any]:
     }
 
 
-# --- STEP 2A: Analyze Disputes (Read-Only + Claude Reasoning) ---
+# --- STEP 2A: Analyze Disputes (Read-Only + LLM Reasoning) ---
 
 def analyze_disputes(state: TreasuryState) -> Dict[str, Any]:
     raw_disputes = paypal_client.list_open_disputes()
     analyzed: List[DisputeEvidence] = []
 
-    llm = _get_claude() if os.getenv("ANTHROPIC_API_KEY") else None
+    llm = _get_llm()
 
     for item in raw_disputes:
         d_id = item.get("dispute_id", "PP-D-UNKNOWN")
@@ -189,12 +206,12 @@ def analyze_disputes(state: TreasuryState) -> Dict[str, Any]:
     return {"open_disputes": analyzed}
 
 
-# --- STEP 2B: Analyze Invoices (Read-Only + Claude Reasoning) ---
+# --- STEP 2B: Analyze Invoices (Read-Only + LLM Reasoning) ---
 
 def analyze_invoices(state: TreasuryState) -> Dict[str, Any]:
     raw_invoices = paypal_client.list_overdue_invoices()
     analyzed: List[OverdueInvoice] = []
-    llm = _get_claude() if os.getenv("ANTHROPIC_API_KEY") else None
+    llm = _get_llm()
 
     for inv in raw_invoices:
         inv_id = inv.get("id", "INV2-UNKNOWN")
@@ -478,6 +495,10 @@ def verify_and_audit(state: TreasuryState) -> Dict[str, Any]:
             )
         )
 
+    actual_unlocked_usd = round(
+        state["projected_friday_balance_usd"] - state["available_balance_usd"], 2
+    )
+
     ending_after_payout_usd = round(
         state["projected_friday_balance_usd"]
         - (state["target_obligation"].amount_required_usd if payout_id else 0.0),
@@ -485,7 +506,7 @@ def verify_and_audit(state: TreasuryState) -> Dict[str, Any]:
     )
 
     summary = (
-        f"Unlocked ${state['immediate_friday_cash_usd']:,.2f} "
+        f"Unlocked ${actual_unlocked_usd:,.2f} "
         f"in Friday working capital across approved disputes and invoices. "
         f"Supplier payout {payout_id or 'N/A'} status: {final_payout_status}. "
         f"Projected post-payout balance: ${ending_after_payout_usd:,.2f}."
