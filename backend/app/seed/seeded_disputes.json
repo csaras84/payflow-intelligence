@@ -1,0 +1,47 @@
+[
+  {
+    "dispute_id": "PP-D-90418",
+    "reason": "MERCHANDISE_OR_SERVICE_NOT_RECEIVED",
+    "status": "WAITING_FOR_SELLER_RESPONSE",
+    "dispute_amount": {
+      "currency_code": "USD",
+      "value": "650.00"
+    },
+    "disputed_transactions": [
+      {
+        "seller_transaction_id": "CAP-88210"
+      }
+    ],
+    "seeded": true
+  },
+  {
+    "dispute_id": "PP-D-90422",
+    "reason": "MERCHANDISE_OR_SERVICE_NOT_AS_DESCRIBED",
+    "status": "WAITING_FOR_SELLER_RESPONSE",
+    "dispute_amount": {
+      "currency_code": "USD",
+      "value": "400.00"
+    },
+    "disputed_transactions": [
+      {
+        "seller_transaction_id": "CAP-88219"
+      }
+    ],
+    "seeded": true
+  },
+  {
+    "dispute_id": "PP-D-90429",
+    "reason": "MERCHANDISE_OR_SERVICE_NOT_RECEIVED",
+    "status": "WAITING_FOR_SELLER_RESPONSE",
+    "dispute_amount": {
+      "currency_code": "USD",
+      "value": "180.00"
+    },
+    "disputed_transactions": [
+      {
+        "seller_transaction_id": "CAP-88244"
+      }
+    ],
+    "seeded": true
+  }
+]

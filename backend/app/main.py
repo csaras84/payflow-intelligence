@@ -1,5 +1,5 @@
 import uuid
-from typing import List, Optional
+from typing import List
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -36,7 +36,13 @@ def create_treasury_plan(req: PlanRequest):
         "audit_log": [],
     }
 
-    treasury_graph.invoke(initial_state, config=config)
+    try:
+        treasury_graph.invoke(initial_state, config=config)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"{type(e).__name__}: {e}"
+        )
+
     snapshot = treasury_graph.get_state(config)
     return {"thread_id": thread_id, "state": snapshot.values}
 
@@ -48,10 +54,16 @@ def execute_approved_plan(req: ExecuteRequest):
     if not snapshot.values:
         raise HTTPException(status_code=404, detail="Run thread_id not found")
 
-    treasury_graph.invoke(
-        Command(resume={"approved_lever_ids": req.approved_lever_ids}),
-        config=config,
-    )
+    try:
+        treasury_graph.invoke(
+            Command(resume={"approved_lever_ids": req.approved_lever_ids}),
+            config=config,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"{type(e).__name__}: {e}"
+        )
+
     final_snapshot = treasury_graph.get_state(config)
     return {"thread_id": req.thread_id, "state": final_snapshot.values}
 

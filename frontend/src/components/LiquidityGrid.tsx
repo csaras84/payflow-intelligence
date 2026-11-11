@@ -1,62 +1,112 @@
-export interface LiquidityRow {
-  currency: string;
-  available: number;
-  inflow_30d: number;
-  outflow_30d: number;
-  net_30d: number;
-  status: "low" | "healthy";
+import React, { useMemo } from "react";
+import { AllCommunityModule, ModuleRegistry, ColDef } from "ag-grid-community";
+import { AgGridReact } from "ag-grid-react";
+
+ModuleRegistry.registerModules([AllCommunityModule]);
+
+export interface LiquidityLever {
+  lever_id: string;
+  source_type: "PAYPAL_DISPUTE_HOLD" | "OVERDUE_PAYPAL_INVOICE";
+  counterparty: string;
+  gross_amount_usd: number;
+  net_unlockable_usd: number;
+  recovery_probability: number;
+  expected_recovery_usd: number;
+  available_by_friday_usd: number;
+  est_settlement_hours: number;
+  priority_score: number;
+  paypal_action: string;
+  ai_reasoning: string;
+  drafted_message: string;
+  status: "PROPOSED" | "APPROVED" | "EXECUTED" | "SKIPPED";
 }
 
 interface Props {
-  rows: LiquidityRow[];
-  threshold: number;
+  rows: LiquidityLever[];
+  selectedIds: Record<string, boolean>;
+  onToggle: (id: string, checked: boolean) => void;
+  locked: boolean;
 }
 
-const fmt = (n: number, cur: string) =>
-  new Intl.NumberFormat(undefined, { style: "currency", currency: cur }).format(n);
+const fmtUsd = (n?: number) =>
+  typeof n === "number" ? `$${n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "$0.00";
 
-export default function LiquidityGrid({ rows, threshold }: Props) {
-  if (rows.length === 0) return <p>No balance data yet.</p>;
+export default function LiquidityGrid({ rows, selectedIds, onToggle, locked }: Props) {
+  const columnDefs = useMemo<ColDef<LiquidityLever>[]>(
+    () => [
+      {
+        headerName: "Approve",
+        field: "lever_id",
+        width: 90,
+        cellRenderer: (params: any) => {
+          const id = params.value as string;
+          return (
+            <input
+              type="checkbox"
+              disabled={locked}
+              checked={!!selectedIds[id]}
+              onChange={(e) => onToggle(id, e.target.checked)}
+              style={{ width: 16, height: 16, cursor: locked ? "default" : "pointer" }}
+            />
+          );
+        },
+      },
+      {
+        headerName: "Source",
+        field: "source_type",
+        width: 150,
+        valueFormatter: (p) =>
+          p.value === "PAYPAL_DISPUTE_HOLD" ? "Dispute Hold" : "Overdue Invoice",
+      },
+      { headerName: "Case / Counterparty", field: "counterparty", width: 220 },
+      {
+        headerName: "Trapped",
+        field: "gross_amount_usd",
+        width: 115,
+        valueFormatter: (p) => fmtUsd(p.value),
+      },
+      {
+        headerName: "Cash by Friday",
+        field: "available_by_friday_usd",
+        width: 140,
+        cellStyle: (p) => ({
+          fontWeight: 700,
+          color: (p.value || 0) > 0 ? "#047857" : "#6b7280",
+        }),
+        valueFormatter: (p) => fmtUsd(p.value),
+      },
+      {
+        headerName: "Expected Recovery",
+        field: "expected_recovery_usd",
+        width: 165,
+        valueFormatter: (p) =>
+          `${fmtUsd(p.value)} (${Math.round((p.data?.recovery_probability || 0) * 100)}%)`,
+      },
+      { headerName: "PayPal Action", field: "paypal_action", width: 230 },
+      {
+        headerName: "AI Strategy & Reasoning",
+        field: "ai_reasoning",
+        flex: 1,
+        minWidth: 320,
+      },
+      { headerName: "Status", field: "status", width: 115 },
+    ],
+    [selectedIds, locked, onToggle]
+  );
 
   return (
-    <section style={{ marginTop: 24 }}>
-      <h2>Liquidity</h2>
-      <p style={{ color: "#666" }}>Low-balance threshold: {threshold.toLocaleString()}</p>
-      <table style={{ width: "100%", borderCollapse: "collapse" }}>
-        <thead>
-          <tr style={{ textAlign: "left", borderBottom: "1px solid #ddd" }}>
-            <th>Currency</th>
-            <th>Available</th>
-            <th>Inflow (30d)</th>
-            <th>Outflow (30d)</th>
-            <th>Net (30d)</th>
-            <th>Status</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r) => (
-            <tr key={r.currency} style={{ borderBottom: "1px solid #f0f0f0" }}>
-              <td>{r.currency}</td>
-              <td>{fmt(r.available, r.currency)}</td>
-              <td>{fmt(r.inflow_30d, r.currency)}</td>
-              <td>{fmt(r.outflow_30d, r.currency)}</td>
-              <td style={{ color: r.net_30d >= 0 ? "green" : "crimson" }}>{fmt(r.net_30d, r.currency)}</td>
-              <td>
-                <span
-                  style={{
-                    padding: "2px 8px",
-                    borderRadius: 12,
-                    background: r.status === "low" ? "#fde2e2" : "#e2f5e9",
-                    color: r.status === "low" ? "#a12" : "#185",
-                  }}
-                >
-                  {r.status}
-                </span>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <section style={{ marginBottom: 20 }}>
+      <h3 style={{ margin: "0 0 8px", fontSize: 16 }}>
+        Ranked Working-Capital Levers (AG Grid — Disputes & Overdue Invoices)
+      </h3>
+      <div style={{ height: 310, width: "100%" }}>
+        <AgGridReact
+          rowData={rows}
+          columnDefs={columnDefs}
+          rowHeight={48}
+          headerHeight={40}
+        />
+      </div>
     </section>
   );
 }

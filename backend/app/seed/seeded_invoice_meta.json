@@ -1,0 +1,14 @@
+{
+  "INV2-DVSE-CYL3-N3WF-ULM9": {
+    "days_overdue": 12,
+    "historical_reliability": 0.88
+  },
+  "INV2-6Y4Y-BTR3-P3KY-GPM4": {
+    "days_overdue": 6,
+    "historical_reliability": 0.94
+  },
+  "INV2-ZN8L-DSZL-QFC9-YV63": {
+    "days_overdue": 15,
+    "historical_reliability": 0.8
+  }
+}

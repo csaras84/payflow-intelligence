@@ -1,8 +1,11 @@
 import os
 import math
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any, Dict, List, Literal
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field
+from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from app.graph.state import (
     AuditLogEntry,
     DisputeEvidence,
@@ -12,6 +15,12 @@ from app.graph.state import (
     TreasuryState,
 )
 from app.tools.paypal_client import PayPalSandboxClient
+
+# Load .env from current working directory AND repo root
+load_dotenv()
+root_env = Path(__file__).resolve().parents[3] / ".env"
+if root_env.exists():
+    load_dotenv(dotenv_path=root_env, override=False)
 
 paypal_client = PayPalSandboxClient()
 
@@ -29,11 +38,15 @@ SAMPLE_COURIER_MANIFEST = {
 
 
 class DisputeDecisionSchema(BaseModel):
-    recommended_strategy: str = Field(
-        description="One of: PROVIDE_EVIDENCE, MAKE_PARTIAL_OFFER, ACCEPT_FULL_CLAIM"
+    recommended_strategy: Literal[
+        "PROVIDE_EVIDENCE",
+        "MAKE_PARTIAL_OFFER",
+        "ACCEPT_FULL_CLAIM",
+    ] = Field(
+        description="Choose PROVIDE_EVIDENCE if signed delivery proof exists, MAKE_PARTIAL_OFFER to quickly unlock most cash on a quality complaint, or ACCEPT_FULL_CLAIM if tracking is missing on a non-receipt claim."
     )
     offer_percentage: float = Field(
-        description="If MAKE_PARTIAL_OFFER, fraction of dispute amount to refund (e.g. 0.20). Otherwise 0.0"
+        description="If MAKE_PARTIAL_OFFER, fraction of dispute amount to refund (e.g. 0.20). Otherwise 0.0."
     )
     ai_reasoning: str = Field(
         description="1-2 concise sentences explaining why this strategy maximizes Friday cash."
@@ -53,34 +66,45 @@ class InvoiceReminderSchema(BaseModel):
 
 
 def _get_llm():
-    """Return the configured chat model, or None to use the rule-based fallback.
+    azure_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
+    azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip().rstrip("/")
+    azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1-mini").strip()
+    azure_version = os.getenv("AZURE_OPENAI_API_VERSION", "2025-04-14").strip()
 
-    Order: Azure OpenAI (if AZURE_OPENAI_* is set) -> Anthropic (if ANTHROPIC_API_KEY
-    is set) -> None. Imports are lazy so a provider's package is only needed if used.
-    """
-    if os.getenv("AZURE_OPENAI_API_KEY") and os.getenv("AZURE_OPENAI_ENDPOINT") and os.getenv("AZURE_OPENAI_DEPLOYMENT"):
-        from langchain_openai import AzureChatOpenAI
-
+    if azure_key and azure_endpoint:
+        # If endpoint ends with /openai/v1, use Azure's v1 OpenAI-compatible endpoint
+        if azure_endpoint.endswith("/openai/v1"):
+            return ChatOpenAI(
+                model=azure_deployment,
+                api_key=azure_key,
+                base_url=azure_endpoint,
+                temperature=0.1,
+                default_headers={"api-key": azure_key},
+            )
+        # Classic Azure resource endpoint
+        base_azure_url = azure_endpoint.split("/openai")[0]
         return AzureChatOpenAI(
-            azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21"),
+            azure_endpoint=base_azure_url,
+            api_key=azure_key,
+            azure_deployment=azure_deployment,
+            api_version=azure_version,
             temperature=0.1,
         )
-    if os.getenv("ANTHROPIC_API_KEY"):
-        from langchain_anthropic import ChatAnthropic
 
-        return ChatAnthropic(model=os.getenv("LLM_MODEL", "claude-sonnet-5-5"), temperature=0.1)
-    return None
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if openai_key:
+        model_name = os.getenv("LLM_MODEL", "gpt-4.1-mini").strip()
+        return ChatOpenAI(model=model_name, temperature=0.1, api_key=openai_key)
+
+    raise RuntimeError(
+        "Neither AZURE_OPENAI_API_KEY nor OPENAI_API_KEY was found in .env."
+    )
 
 
 # --- STEP 1: Diagnose Cash Gap (Read-Only) ---
 
 def diagnose_cash_gap(state: TreasuryState) -> Dict[str, Any]:
     balance_usd = paypal_client.get_available_balance_usd()
-
-    # Default target: $1,800 supplier payment due Friday
     required_usd = 1800.0
 
     obligation = SupplierObligation(
@@ -100,13 +124,14 @@ def diagnose_cash_gap(state: TreasuryState) -> Dict[str, Any]:
     }
 
 
-# --- STEP 2A: Analyze Disputes (Read-Only + LLM Reasoning) ---
+# --- STEP 2A: Analyze Disputes (Read-Only + Strict GPT-4.1-mini Reasoning) ---
 
 def analyze_disputes(state: TreasuryState) -> Dict[str, Any]:
     raw_disputes = paypal_client.list_open_disputes()
     analyzed: List[DisputeEvidence] = []
 
     llm = _get_llm()
+    structured_llm = llm.with_structured_output(DisputeDecisionSchema)
 
     for item in raw_disputes:
         d_id = item.get("dispute_id", "PP-D-UNKNOWN")
@@ -116,7 +141,6 @@ def analyze_disputes(state: TreasuryState) -> Dict[str, Any]:
         txs = item.get("disputed_transactions", [{}])
         capture_id = txs[0].get("seller_transaction_id", "CAP-00000") if txs else "CAP-00000"
 
-        # Match against sample courier PDF manifest
         manifest = SAMPLE_COURIER_MANIFEST.get(d_id) or (
             SAMPLE_COURIER_MANIFEST["PP-D-90418"] if len(analyzed) == 0 else None
         )
@@ -126,44 +150,24 @@ def analyze_disputes(state: TreasuryState) -> Dict[str, Any]:
         deliv_status = manifest["delivery_status"] if manifest else "MISSING"
         pdf_file = manifest["pdf_source_file"] if manifest else None
 
-        # Default deterministic fallback if ANTHROPIC_API_KEY is unset during unit tests
-        strategy = "PROVIDE_EVIDENCE" if deliv_status == "DELIVERED" else (
-            "MAKE_PARTIAL_OFFER" if reason == "MERCHANDISE_OR_SERVICE_NOT_AS_DESCRIBED" else "ACCEPT_FULL_CLAIM"
-        )
-        offer_pct = 0.20 if strategy == "MAKE_PARTIAL_OFFER" else 0.0
-        ai_reason = (
-            f"Signed courier POD ({pdf_file}) confirms delivery via {carrier} #{tracking}; contesting unlocks full hold."
-            if strategy == "PROVIDE_EVIDENCE"
-            else (
-                "Subjective quality dispute would freeze $400 for 30+ days; a 20% ($80) partial refund offer settles immediately and releases $320 by Friday."
-                if strategy == "MAKE_PARTIAL_OFFER"
-                else "No courier delivery scan on file; accepting claim avoids chargeback fees."
-            )
-        )
-        draft_note = (
-            f"Order fulfilled via {carrier} tracking #{tracking}. Signed proof of delivery attached from {pdf_file}."
-            if strategy == "PROVIDE_EVIDENCE"
-            else "We value your business and offer an immediate $80.00 partial refund so you can keep the order without return shipping."
+        # Direct LLM invocation — raises immediately if OpenAI call fails
+        decision: DisputeDecisionSchema = structured_llm.invoke(
+            f"""You are a merchant working-capital AI. The merchant urgently needs $1,800 by Friday to pay a wholesale supplier.
+Dispute ID: {d_id}
+Reason: {reason}
+Held Amount: ${amount_usd:.2f} USD
+Courier PDF Evidence: {manifest if manifest else 'No signed delivery PDF found'}
+
+Choose between:
+- PROVIDE_EVIDENCE (if signed courier proof of delivery exists)
+- MAKE_PARTIAL_OFFER (e.g. offer_percentage=0.20 refund to immediately settle a subjective NOT_AS_DESCRIBED complaint and release 80% of the held cash by Friday)
+- ACCEPT_FULL_CLAIM (if item was not received and no courier tracking exists)"""
         )
 
-        if llm:
-            try:
-                structured_llm = llm.with_structured_output(DisputeDecisionSchema)
-                decision = structured_llm.invoke(
-                    f"""You are a merchant working-capital AI. The merchant urgently needs cash by Friday.
-                    Dispute ID: {d_id}
-                    Reason: {reason}
-                    Held Amount: ${amount_usd:.2f} USD
-                    Courier PDF Evidence: {manifest if manifest else 'No signed delivery PDF found'}
-                    Choose between PROVIDE_EVIDENCE (if strong proof of delivery exists), MAKE_PARTIAL_OFFER (e.g. 0.20 refund to immediately release the remaining 80% of held cash on a quality complaint), or ACCEPT_FULL_CLAIM (if unfulfilled/missing tracking)."""
-                )
-                if decision.recommended_strategy in ("PROVIDE_EVIDENCE", "MAKE_PARTIAL_OFFER", "ACCEPT_FULL_CLAIM"):
-                    strategy = decision.recommended_strategy
-                offer_pct = max(0.0, min(1.0, decision.offer_percentage))
-                ai_reason = decision.ai_reasoning
-                draft_note = decision.drafted_evidence_note
-            except Exception:
-                pass
+        strategy = decision.recommended_strategy
+        offer_pct = max(0.0, min(1.0, decision.offer_percentage))
+        ai_reason = decision.ai_reasoning
+        draft_note = decision.drafted_evidence_note
 
         # Deterministic Python arithmetic for cash unlocked & probability
         if strategy == "PROVIDE_EVIDENCE":
@@ -172,7 +176,7 @@ def analyze_disputes(state: TreasuryState) -> Dict[str, Any]:
             prob = 0.92
             by_friday = True
         elif strategy == "MAKE_PARTIAL_OFFER":
-            offer_usd = round(amount_usd * (offer_pct or 0.20), 2)
+            offer_usd = round(amount_usd * (offer_pct if offer_pct > 0 else 0.20), 2)
             net_unlocked = round(amount_usd - offer_usd, 2)
             prob = 0.95
             by_friday = True
@@ -206,12 +210,14 @@ def analyze_disputes(state: TreasuryState) -> Dict[str, Any]:
     return {"open_disputes": analyzed}
 
 
-# --- STEP 2B: Analyze Invoices (Read-Only + LLM Reasoning) ---
+# --- STEP 2B: Analyze Invoices (Read-Only + Strict GPT-4.1-mini Reasoning) ---
 
 def analyze_invoices(state: TreasuryState) -> Dict[str, Any]:
     raw_invoices = paypal_client.list_overdue_invoices()
     analyzed: List[OverdueInvoice] = []
+
     llm = _get_llm()
+    structured_llm = llm.with_structured_output(InvoiceReminderSchema)
 
     for inv in raw_invoices:
         inv_id = inv.get("id", "INV2-UNKNOWN")
@@ -224,28 +230,18 @@ def analyze_invoices(state: TreasuryState) -> Dict[str, Any]:
         days_overdue = int(inv.get("days_overdue", 9))
         reliability = float(inv.get("historical_reliability", 0.85))
 
-        # Be honest about timing: only high-reliability B2B accounts (<10 days overdue) are counted as arriving by Friday
         arrives_friday = reliability >= 0.90 and days_overdue <= 7
 
-        ai_reason = (
-            f"{cust_name} has a {int(reliability*100)}% on-time track record ({days_overdue}d overdue); expected recovery is high, though settlement typically lands after 48–72h."
+        # Direct LLM invocation — raises immediately if OpenAI call fails
+        res: InvoiceReminderSchema = structured_llm.invoke(
+            f"""Draft a concise payment reminder and a 1-sentence treasury assessment for:
+Customer: {cust_name}
+Invoice Number: {inv_num}
+Amount Due: ${amount_usd:.2f} USD
+Days Overdue: {days_overdue}
+Historical Reliability Score: {reliability}
+Likely to Settle by Friday: {arrives_friday}"""
         )
-        draft_reminder = (
-            f"Hi {cust_name} team — friendly reminder that Invoice {inv_num} (${amount_usd:.2f}) is {days_overdue} days past due. You can settle instantly via your PayPal invoice link today."
-        )
-
-        if llm:
-            try:
-                structured_llm = llm.with_structured_output(InvoiceReminderSchema)
-                res = structured_llm.invoke(
-                    f"""Draft a concise payment reminder and 1-sentence treasury assessment for:
-                    Customer: {cust_name}, Invoice: {inv_num}, Amount: ${amount_usd:.2f} USD,
-                    Days Overdue: {days_overdue}, Historical Reliability: {reliability}."""
-                )
-                ai_reason = res.ai_reasoning
-                draft_reminder = res.drafted_reminder_note
-            except Exception:
-                pass
 
         analyzed.append(
             OverdueInvoice(
@@ -257,8 +253,8 @@ def analyze_invoices(state: TreasuryState) -> Dict[str, Any]:
                 days_overdue=days_overdue,
                 historical_reliability=reliability,
                 arrives_by_friday=arrives_friday,
-                ai_reasoning=ai_reason,
-                drafted_reminder_note=draft_reminder,
+                ai_reasoning=res.ai_reasoning,
+                drafted_reminder_note=res.drafted_reminder_note,
             )
         )
 
@@ -330,7 +326,6 @@ def synthesize_plan(state: TreasuryState) -> Dict[str, Any]:
             )
         )
 
-    # Sort descending by deterministic priority score
     levers.sort(key=lambda x: x.priority_score, reverse=True)
 
     friday_cash_usd = round(sum(l.available_by_friday_usd for l in levers if l.status == "PROPOSED"), 2)
@@ -422,7 +417,6 @@ def execute_plan(state: TreasuryState) -> Dict[str, Any]:
 
         updated_levers.append(lever)
 
-    # Execute outbound supplier Payout via POST /v1/payments/payouts
     obligation = state["target_obligation"]
     new_friday_balance_usd = round(state["available_balance_usd"] + unlocked_friday_usd, 2)
 
@@ -498,7 +492,6 @@ def verify_and_audit(state: TreasuryState) -> Dict[str, Any]:
     actual_unlocked_usd = round(
         state["projected_friday_balance_usd"] - state["available_balance_usd"], 2
     )
-
     ending_after_payout_usd = round(
         state["projected_friday_balance_usd"]
         - (state["target_obligation"].amount_required_usd if payout_id else 0.0),

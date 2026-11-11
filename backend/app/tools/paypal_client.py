@@ -1,40 +1,63 @@
+import json
 import os
 import time
 import uuid
-import httpx
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+import httpx
 from dotenv import load_dotenv
 
+# Load .env from current working directory or repo root
 load_dotenv()
+root_env = Path(__file__).resolve().parents[3] / ".env"
+if root_env.exists():
+    load_dotenv(dotenv_path=root_env, override=False)
+
+SEED_DIR = Path(__file__).resolve().parents[1] / "seed"
+SEEDED_DISPUTES_FILE = SEED_DIR / "seeded_disputes.json"
+SEEDED_INVOICE_META_FILE = SEED_DIR / "seeded_invoice_meta.json"
 
 
 class PayPalSandboxClient:
     def __init__(self) -> None:
-        self.client_id = os.getenv("PAYPAL_CLIENT_ID", "")
-        self.client_secret = os.getenv("PAYPAL_CLIENT_SECRET", "")
+        self.client_id = (
+            os.getenv("PAYPAL_CLIENT_ID", "").strip().strip('"').strip("'")
+        )
+        self.client_secret = (
+            os.getenv("PAYPAL_CLIENT_SECRET", "").strip().strip('"').strip("'")
+        )
         self.base_url = "https://api-m.sandbox.paypal.com"
         self._access_token: Optional[str] = None
         self._token_expiry: float = 0.0
 
-        # Optional PayPal Agent Toolkit initialization for hackathon compliance
         self.toolkit = None
-        try:
-            from paypal_agent_toolkit.langchain.toolkit import PayPalToolkit
-            if self.client_id and self.client_secret:
+        if self.client_id and self.client_secret:
+            try:
+                from paypal_agent_toolkit.langchain.toolkit import PayPalToolkit
+
                 self.toolkit = PayPalToolkit(
                     client_id=self.client_id,
                     secret=self.client_secret,
                     environment="sandbox",
                 )
-        except Exception:
-            self.toolkit = None
+            except Exception:
+                self.toolkit = None
+
+    def _raise_for_paypal_error(self, resp: httpx.Response, context: str) -> None:
+        if resp.status_code >= 400:
+            raise RuntimeError(
+                f"PayPal Sandbox API Error during {context} "
+                f"[HTTP {resp.status_code} {resp.request.method} {resp.request.url}]: {resp.text}"
+            )
 
     def _get_token(self) -> str:
         if self._access_token and time.time() < self._token_expiry:
             return self._access_token
 
         if not self.client_id or not self.client_secret:
-            raise ValueError("Missing PAYPAL_CLIENT_ID or PAYPAL_CLIENT_SECRET in .env")
+            raise RuntimeError(
+                "Missing PAYPAL_CLIENT_ID or PAYPAL_CLIENT_SECRET in .env"
+            )
 
         with httpx.Client(timeout=20.0) as client:
             resp = client.post(
@@ -43,7 +66,7 @@ class PayPalSandboxClient:
                 data={"grant_type": "client_credentials"},
                 headers={"Accept": "application/json"},
             )
-            resp.raise_for_status()
+            self._raise_for_paypal_error(resp, "OAuth2 token exchange")
             data = resp.json()
             self._access_token = data["access_token"]
             self._token_expiry = time.time() + int(data.get("expires_in", 3200)) - 60
@@ -56,149 +79,132 @@ class PayPalSandboxClient:
             "Accept": "application/json",
         }
 
+    # --- Helpers for Seeded Disputes State File ---
+
+    def _load_seeded_disputes(self) -> List[Dict[str, Any]]:
+        if not SEEDED_DISPUTES_FILE.exists():
+            return []
+        return json.loads(SEEDED_DISPUTES_FILE.read_text(encoding="utf-8"))
+
+    def _is_seeded_dispute(self, dispute_id: str, capture_id: str = "") -> bool:
+        for d in self._load_seeded_disputes():
+            if d.get("dispute_id") == dispute_id:
+                return True
+            txs = d.get("disputed_transactions", [{}])
+            if capture_id and txs and txs[0].get("seller_transaction_id") == capture_id:
+                return True
+        return False
+
+    def _update_seeded_dispute_status(self, dispute_id: str, new_status: str, note: str) -> None:
+        disputes = self._load_seeded_disputes()
+        for d in disputes:
+            if d.get("dispute_id") == dispute_id:
+                d["status"] = new_status
+                d["last_action_note"] = note
+        SEEDED_DISPUTES_FILE.write_text(json.dumps(disputes, indent=2), encoding="utf-8")
+
     # --- READ-ONLY OPERATIONS (Used above Merchant Approval gate) ---
 
     def get_available_balance_usd(self) -> float:
-        try:
-            with httpx.Client(timeout=15.0) as client:
-                resp = client.get(
-                    f"{self.base_url}/v1/reporting/balances",
-                    params={"currency_code": "USD"},
-                    headers=self._headers(),
-                )
-                if resp.status_code == 200:
-                    balances = resp.json().get("balances", [])
-                    for b in balances:
-                        if b.get("currency") == "USD":
-                            val = b.get("available_balance", {}).get("value")
-                            if val is not None:
-                                return float(val)
-        except Exception:
-            pass
-        # Baseline merchant cash before unlocking trapped working capital
-        return 620.00
+        override_bal = os.getenv("DEMO_STARTING_BALANCE_USD")
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.get(
+                f"{self.base_url}/v1/reporting/balances",
+                params={"currency_code": "USD"},
+                headers=self._headers(),
+            )
+            self._raise_for_paypal_error(resp, "GET /v1/reporting/balances")
+            if override_bal is not None:
+                return float(override_bal)
+            balances = resp.json().get("balances", [])
+            for b in balances:
+                if b.get("currency") == "USD":
+                    val = b.get("available_balance", {}).get("value")
+                    if val is not None:
+                        return float(val)
+            return 0.0
 
     def list_open_disputes(self) -> List[Dict[str, Any]]:
-        try:
-            with httpx.Client(timeout=15.0) as client:
-                resp = client.get(
-                    f"{self.base_url}/v1/customer/disputes",
-                    headers=self._headers(),
-                )
-                if resp.status_code == 200:
-                    items = resp.json().get("items", [])
-                    if items:
-                        detailed = []
-                        for item in items[:3]:
-                            d_id = item.get("dispute_id")
-                            detail_resp = client.get(
-                                f"{self.base_url}/v1/customer/disputes/{d_id}",
-                                headers=self._headers(),
-                            )
-                            detailed.append(
-                                detail_resp.json() if detail_resp.status_code == 200 else item
-                            )
-                        return detailed
-        except Exception:
-            pass
+        # Always authenticate and query live PayPal Sandbox first
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.get(
+                f"{self.base_url}/v1/customer/disputes",
+                headers=self._headers(),
+            )
+            self._raise_for_paypal_error(resp, "GET /v1/customer/disputes")
+            items = resp.json().get("items", [])
+            if items:
+                detailed: List[Dict[str, Any]] = []
+                for item in items[:5]:
+                    d_id = item.get("dispute_id")
+                    detail_resp = client.get(
+                        f"{self.base_url}/v1/customer/disputes/{d_id}",
+                        headers=self._headers(),
+                    )
+                    self._raise_for_paypal_error(
+                        detail_resp, f"GET /v1/customer/disputes/{d_id}"
+                    )
+                    detailed.append(detail_resp.json())
+                return detailed
 
-        # Fallback only if Sandbox disputes haven't indexed yet
-        return [
-            {
-                "dispute_id": "PP-D-90418",
-                "reason": "MERCHANDISE_OR_SERVICE_NOT_RECEIVED",
-                "status": "WAITING_FOR_SELLER_RESPONSE",
-                "dispute_amount": {"currency_code": "USD", "value": "650.00"},
-                "disputed_transactions": [{"seller_transaction_id": "CAP-88210"}],
-            },
-            {
-                "dispute_id": "PP-D-90422",
-                "reason": "MERCHANDISE_OR_SERVICE_NOT_AS_DESCRIBED",
-                "status": "WAITING_FOR_SELLER_RESPONSE",
-                "dispute_amount": {"currency_code": "USD", "value": "400.00"},
-                "disputed_transactions": [{"seller_transaction_id": "CAP-88255"}],
-            },
-            {
-                "dispute_id": "PP-D-90429",
-                "reason": "MERCHANDISE_OR_SERVICE_NOT_RECEIVED",
-                "status": "WAITING_FOR_SELLER_RESPONSE",
-                "dispute_amount": {"currency_code": "USD", "value": "180.00"},
-                "disputed_transactions": [{"seller_transaction_id": "CAP-88301"}],
-            },
-        ]
+        # If live Sandbox returned 200 OK with 0 open disputes, load seeded_disputes.json
+        seeded = self._load_seeded_disputes()
+        if not seeded:
+            raise RuntimeError(
+                "PayPal Sandbox returned 0 open disputes and seeded_disputes.json is missing. "
+                "Run `python -m app.seed.seed_sandbox` first."
+            )
+        return seeded
 
     def list_overdue_invoices(self) -> List[Dict[str, Any]]:
-        try:
-            with httpx.Client(timeout=15.0) as client:
-                resp = client.get(
-                    f"{self.base_url}/v2/invoicing/invoices",
-                    params={"page_size": 10, "total_required": "true"},
-                    headers=self._headers(),
-                )
-                if resp.status_code == 200:
-                    items = resp.json().get("items", [])
-                    unpaid = [
-                        inv for inv in items
-                        if inv.get("status") in ("SENT", "UNPAID", "PARTIALLY_PAID", "PAYMENT_PENDING")
-                    ]
-                    if unpaid:
-                        return unpaid[:4]
-        except Exception:
-            pass
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.get(
+                f"{self.base_url}/v2/invoicing/invoices",
+                params={"page_size": 10, "total_required": "true"},
+                headers=self._headers(),
+            )
+            self._raise_for_paypal_error(resp, "GET /v2/invoicing/invoices")
+            items = resp.json().get("items", [])
+            unpaid = [
+                inv
+                for inv in items
+                if inv.get("status")
+                in ("SENT", "UNPAID", "PARTIALLY_PAID", "PAYMENT_PENDING")
+            ][:3]
 
-        return [
-            {
-                "id": "INV2-X89A-4410-9921-1001",
-                "detail": {"invoice_number": "INV-2026-104"},
-                "primary_recipients": [
-                    {
-                        "billing_info": {
-                            "name": {"full_name": "Artisan Cafe Group"},
-                            "email_address": "ap@artisancafe.example.com",
-                        }
-                    }
-                ],
-                "amount": {"currency_code": "USD", "value": "520.00"},
-                "days_overdue": 11,
-                "historical_reliability": 0.88,
-            },
-            {
-                "id": "INV2-X89A-4410-9921-1002",
-                "detail": {"invoice_number": "INV-2026-108"},
-                "primary_recipients": [
-                    {
-                        "billing_info": {
-                            "name": {"full_name": "Metro Co-Work Pantry"},
-                            "email_address": "finance@metrocowork.example.com",
-                        }
-                    }
-                ],
-                "amount": {"currency_code": "USD", "value": "340.00"},
-                "days_overdue": 6,
-                "historical_reliability": 0.92,
-            },
-            {
-                "id": "INV2-X89A-4410-9921-1003",
-                "detail": {"invoice_number": "INV-2026-099"},
-                "primary_recipients": [
-                    {
-                        "billing_info": {
-                            "name": {"full_name": "Harbor Bistro LLC"},
-                            "email_address": "accounts@harborbistro.example.com",
-                        }
-                    }
-                ],
-                "amount": {"currency_code": "USD", "value": "450.00"},
-                "days_overdue": 24,
-                "historical_reliability": 0.55,
-            },
-        ]
+            meta_map: Dict[str, Any] = {}
+            if SEEDED_INVOICE_META_FILE.exists():
+                meta_map = json.loads(
+                    SEEDED_INVOICE_META_FILE.read_text(encoding="utf-8")
+                )
+
+            defaults = [(12, 0.88), (6, 0.94), (15, 0.80)]
+            for idx, inv in enumerate(unpaid):
+                inv_id = inv.get("id", "")
+                if inv_id in meta_map:
+                    inv["days_overdue"] = meta_map[inv_id]["days_overdue"]
+                    inv["historical_reliability"] = meta_map[inv_id]["historical_reliability"]
+                else:
+                    d_over, rel = defaults[idx % len(defaults)]
+                    inv["days_overdue"] = d_over
+                    inv["historical_reliability"] = rel
+
+            return unpaid
 
     # --- WRITE OPERATIONS (Strictly gated behind Merchant Approval) ---
 
     def add_shipment_tracking(
         self, capture_id: str, tracking_number: str, carrier: str = "DHL"
     ) -> Dict[str, Any]:
+        # Validate token is active before proceeding
+        _ = self._get_token()
+        if self._is_seeded_dispute("", capture_id=capture_id):
+            return {
+                "status": "TRACKING_ADDED",
+                "capture_id": capture_id,
+                "live": False,
+            }
+
         payload = {
             "trackers": [
                 {
@@ -209,18 +215,14 @@ class PayPalSandboxClient:
                 }
             ]
         }
-        try:
-            with httpx.Client(timeout=15.0) as client:
-                resp = client.post(
-                    f"{self.base_url}/v1/shipping/trackers-batch",
-                    json=payload,
-                    headers=self._headers(),
-                )
-                if resp.status_code in (200, 201):
-                    return {"status": "TRACKING_ADDED", "capture_id": capture_id, "live": True}
-        except Exception:
-            pass
-        return {"status": "TRACKING_RECORDED_SANDBOX", "capture_id": capture_id, "live": False}
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.post(
+                f"{self.base_url}/v1/shipping/trackers-batch",
+                json=payload,
+                headers=self._headers(),
+            )
+            self._raise_for_paypal_error(resp, "POST /v1/shipping/trackers-batch")
+            return {"status": "TRACKING_ADDED", "capture_id": capture_id, "live": True}
 
     def provide_dispute_evidence(
         self,
@@ -229,7 +231,11 @@ class PayPalSandboxClient:
         tracking_number: str,
         notes: str,
     ) -> Dict[str, Any]:
-        """Calls POST /v1/customer/disputes/{id}/provide-evidence directly."""
+        _ = self._get_token()
+        if self._is_seeded_dispute(dispute_id):
+            self._update_seeded_dispute_status(dispute_id, "UNDER_REVIEW", notes)
+            return {"dispute_id": dispute_id, "status": "UNDER_REVIEW", "live": False}
+
         payload = {
             "evidences": [
                 {
@@ -246,23 +252,25 @@ class PayPalSandboxClient:
                 }
             ]
         }
-        try:
-            with httpx.Client(timeout=15.0) as client:
-                resp = client.post(
-                    f"{self.base_url}/v1/customer/disputes/{dispute_id}/provide-evidence",
-                    json=payload,
-                    headers=self._headers(),
-                )
-                if resp.status_code in (200, 202, 204):
-                    return {"dispute_id": dispute_id, "status": "UNDER_REVIEW", "live": True}
-        except Exception:
-            pass
-        return {"dispute_id": dispute_id, "status": "EVIDENCE_SUBMITTED", "live": False}
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.post(
+                f"{self.base_url}/v1/customer/disputes/{dispute_id}/provide-evidence",
+                json=payload,
+                headers=self._headers(),
+            )
+            self._raise_for_paypal_error(
+                resp, f"POST /v1/customer/disputes/{dispute_id}/provide-evidence"
+            )
+            return {"dispute_id": dispute_id, "status": "UNDER_REVIEW", "live": True}
 
     def make_dispute_offer(
         self, dispute_id: str, offer_amount_usd: float, note: str
     ) -> Dict[str, Any]:
-        """Calls POST /v1/customer/disputes/{id}/make-offer to settle partially and unfreeze balance."""
+        _ = self._get_token()
+        if self._is_seeded_dispute(dispute_id):
+            self._update_seeded_dispute_status(dispute_id, "OFFER_SENT", note)
+            return {"dispute_id": dispute_id, "status": "OFFER_SENT", "live": False}
+
         payload = {
             "note": note[:2000],
             "offer_amount": {
@@ -271,18 +279,16 @@ class PayPalSandboxClient:
             },
             "offer_type": "REFUND",
         }
-        try:
-            with httpx.Client(timeout=15.0) as client:
-                resp = client.post(
-                    f"{self.base_url}/v1/customer/disputes/{dispute_id}/make-offer",
-                    json=payload,
-                    headers=self._headers(),
-                )
-                if resp.status_code in (200, 202, 204):
-                    return {"dispute_id": dispute_id, "status": "OFFER_SENT", "live": True}
-        except Exception:
-            pass
-        return {"dispute_id": dispute_id, "status": "PARTIAL_OFFER_RECORDED", "live": False}
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.post(
+                f"{self.base_url}/v1/customer/disputes/{dispute_id}/make-offer",
+                json=payload,
+                headers=self._headers(),
+            )
+            self._raise_for_paypal_error(
+                resp, f"POST /v1/customer/disputes/{dispute_id}/make-offer"
+            )
+            return {"dispute_id": dispute_id, "status": "OFFER_SENT", "live": True}
 
     def send_invoice_reminder(
         self, invoice_id: str, subject: str, note: str
@@ -293,23 +299,20 @@ class PayPalSandboxClient:
             "send_to_invoicer": True,
             "send_to_recipient": True,
         }
-        try:
-            with httpx.Client(timeout=15.0) as client:
-                resp = client.post(
-                    f"{self.base_url}/v2/invoicing/invoices/{invoice_id}/remind",
-                    json=payload,
-                    headers=self._headers(),
-                )
-                if resp.status_code in (200, 202, 204):
-                    return {"invoice_id": invoice_id, "status": "REMINDER_SENT", "live": True}
-        except Exception:
-            pass
-        return {"invoice_id": invoice_id, "status": "REMINDER_DISPATCHED", "live": False}
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.post(
+                f"{self.base_url}/v2/invoicing/invoices/{invoice_id}/remind",
+                json=payload,
+                headers=self._headers(),
+            )
+            self._raise_for_paypal_error(
+                resp, f"POST /v2/invoicing/invoices/{invoice_id}/remind"
+            )
+            return {"invoice_id": invoice_id, "status": "REMINDER_SENT", "live": True}
 
     def create_supplier_payout(
         self, recipient_email: str, amount_usd: float, po_reference: str
     ) -> Dict[str, Any]:
-        """Calls POST /v1/payments/payouts to pay the wholesale supplier from merchant balance."""
         sender_batch_id = f"PAYFLOW-{po_reference}-{uuid.uuid4().hex[:6].upper()}"
         payload = {
             "sender_batch_header": {
@@ -327,60 +330,54 @@ class PayPalSandboxClient:
                 }
             ],
         }
-        try:
-            with httpx.Client(timeout=20.0) as client:
-                resp = client.post(
-                    f"{self.base_url}/v1/payments/payouts",
-                    json=payload,
-                    headers=self._headers(),
-                )
-                if resp.status_code in (200, 201):
-                    data = resp.json()
-                    batch_id = data.get("batch_header", {}).get(
-                        "payout_batch_id", sender_batch_id
-                    )
-                    batch_status = data.get("batch_header", {}).get(
-                        "batch_status", "PENDING"
-                    )
-                    return {
-                        "payout_batch_id": batch_id,
-                        "status": batch_status,
-                        "live": True,
-                    }
-        except Exception:
-            pass
-        return {
-            "payout_batch_id": sender_batch_id,
-            "status": "PENDING_SANDBOX_SETTLEMENT",
-            "live": False,
-        }
+        with httpx.Client(timeout=20.0) as client:
+            resp = client.post(
+                f"{self.base_url}/v1/payments/payouts",
+                json=payload,
+                headers=self._headers(),
+            )
+            self._raise_for_paypal_error(resp, "POST /v1/payments/payouts")
+            data = resp.json()
+            batch_id = data.get("batch_header", {}).get(
+                "payout_batch_id", sender_batch_id
+            )
+            batch_status = data.get("batch_header", {}).get(
+                "batch_status", "PENDING"
+            )
+            return {
+                "payout_batch_id": batch_id,
+                "status": batch_status,
+                "live": True,
+            }
 
     def verify_dispute_status(self, dispute_id: str) -> str:
-        try:
-            with httpx.Client(timeout=10.0) as client:
-                resp = client.get(
-                    f"{self.base_url}/v1/customer/disputes/{dispute_id}",
-                    headers=self._headers(),
-                )
-                if resp.status_code == 200:
-                    return resp.json().get("status", "UNDER_REVIEW")
-        except Exception:
-            pass
-        return "UNDER_REVIEW"
+        _ = self._get_token()
+        if self._is_seeded_dispute(dispute_id):
+            for d in self._load_seeded_disputes():
+                if d.get("dispute_id") == dispute_id:
+                    return d.get("status", "UNDER_REVIEW")
+
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get(
+                f"{self.base_url}/v1/customer/disputes/{dispute_id}",
+                headers=self._headers(),
+            )
+            self._raise_for_paypal_error(
+                resp, f"GET /v1/customer/disputes/{dispute_id}"
+            )
+            return resp.json().get("status", "UNDER_REVIEW")
 
     def verify_payout_status(self, payout_batch_id: str) -> str:
-        try:
-            with httpx.Client(timeout=10.0) as client:
-                resp = client.get(
-                    f"{self.base_url}/v1/payments/payouts/{payout_batch_id}",
-                    headers=self._headers(),
-                )
-                if resp.status_code == 200:
-                    return (
-                        resp.json()
-                        .get("batch_header", {})
-                        .get("batch_status", "SUCCESS")
-                    )
-        except Exception:
-            pass
-        return "PROCESSING"
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get(
+                f"{self.base_url}/v1/payments/payouts/{payout_batch_id}",
+                headers=self._headers(),
+            )
+            self._raise_for_paypal_error(
+                resp, f"GET /v1/payments/payouts/{payout_batch_id}"
+            )
+            return (
+                resp.json()
+                .get("batch_header", {})
+                .get("batch_status", "PROCESSING")
+            )
