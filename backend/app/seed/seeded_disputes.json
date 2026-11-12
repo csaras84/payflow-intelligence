@@ -2,7 +2,7 @@
   {
     "dispute_id": "PP-D-90418",
     "reason": "MERCHANDISE_OR_SERVICE_NOT_RECEIVED",
-    "status": "WAITING_FOR_SELLER_RESPONSE",
+    "status": "UNDER_REVIEW",
     "dispute_amount": {
       "currency_code": "USD",
       "value": "650.00"
@@ -12,7 +12,8 @@
         "seller_transaction_id": "CAP-88210"
       }
     ],
-    "seeded": true
+    "seeded": true,
+    "last_action_note": "Dear PayPal Resolution Center, please find attached the signed proof of delivery from DHL Express confirming that the merchandise was delivered on 2026-11-04 and received by R. Sharma at the front desk. We kindly request the release of the held funds as the item was delivered as per the tracking information."
   },
   {
     "dispute_id": "PP-D-90422",
